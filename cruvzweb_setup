@@ -1,0 +1,759 @@
+# Shared Hosting Node — Installation & Phase-by-Phase Plan
+
+This document contains a step-by-step installation guide and the concrete scripts you can run on an Ubuntu 24 VPS to build a production-capable shared hosting node that supports:
+- Linux webapps (PHP, static, Node, Python, etc.)
+- ASP.NET Core (Kestrel)
+- Per-tenant resource quotas (RAM / CPU / Storage)
+- Foundations for white-labeling and secure password resets
+
+Run the phases in order on a staging server first. Use certbot staging for tests to avoid Let's Encrypt rate limits.
+
+---
+
+## Quick overview
+- Phase 0: Baseline OS hardening and admin user
+- Phase 1: Install core packages (nginx, PHP-FPM, MariaDB, Redis, certbot, .NET)
+- Phase 2: Filesystem layout, groups, initial tenant user
+- Phase 3: nginx HTTP vhost template (ACME challenge + redirect)
+- Phase 4: nginx HTTPS vhost template (static/PHP + Kestrel proxy)
+- Phase 5: PHP-FPM per-site pool template
+- Phase 6: systemd template for Kestrel (kestrel@.service)
+- Phase 7: Provisioning script to create sites
+- Phase 8: Tenant slice (cgroup) creation script (Memory/CPU)
+- Phase 9: DB schema (tenants, users, quotas, password_resets, audit logs)
+- Phase 10: Restic backup script
+- Phase 11: node_exporter installer (Prometheus metrics)
+- Phase 12: Minimal control-plane skeleton (password-reset example)
+- Phase 13: Testing, monitoring, and production rollout checklist
+
+Each phase below includes the purpose, acceptance criteria, and the exact script(s) or templates to place on the server.
+
+---
+
+## Phase 0 — Baseline OS hardening and admin user
+Purpose: secure the VPS access, update OS, create admin user, enable unattended upgrades.
+
+Save as `/usr/local/bin/setup_baseline.sh` and run:
+```bash
+#!/usr/bin/env bash
+# Phase 0: baseline setup for Ubuntu 24
+set -euo pipefail
+
+ADMIN_USER="${1:-cruvzadmin}"
+SSH_PUBKEY_PATH="${2:-}"   # optional: path to public key to copy in
+
+echo "Updating packages..."
+sudo apt update
+sudo apt -y upgrade
+
+echo "Installing minimal tools..."
+sudo apt install -y --no-install-recommends curl wget ca-certificates gnupg lsb-release software-properties-common
+
+echo "Creating admin user: ${ADMIN_USER}"
+if ! id -u "${ADMIN_USER}" >/dev/null 2>&1; then
+  sudo adduser --disabled-password --gecos "" "${ADMIN_USER}"
+  sudo usermod -aG sudo "${ADMIN_USER}"
+fi
+
+if [ -n "${SSH_PUBKEY_PATH}" ] && [ -f "${SSH_PUBKEY_PATH}" ]; then
+  echo "Installing SSH public key for ${ADMIN_USER}"
+  sudo mkdir -p /home/"${ADMIN_USER}"/.ssh
+  sudo chmod 700 /home/"${ADMIN_USER}"/.ssh
+  sudo cat "${SSH_PUBKEY_PATH}" | sudo tee /home/"${ADMIN_USER}"/.ssh/authorized_keys >/dev/null
+  sudo chmod 600 /home/"${ADMIN_USER}"/.ssh/authorized_keys
+  sudo chown -R "${ADMIN_USER}":"${ADMIN_USER}" /home/"${ADMIN_USER}"/.ssh
+fi
+
+echo "Disabling root SSH login..."
+sudo sed -i 's/^#\?\s*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+sudo systemctl restart sshd
+
+echo "Enabling unattended upgrades..."
+sudo apt install -y unattended-upgrades
+sudo dpkg-reconfigure --priority=low unattended-upgrades
+
+echo "Baseline complete."
+```
+
+Acceptance
+- SSH as the admin user works.
+- System packages updated and unattended-upgrades enabled.
+
+---
+
+## Phase 1 — Install core packages
+Purpose: install nginx, PHP-FPM, MariaDB, Redis, certbot, dotnet runtime and enable services.
+
+Save as `/usr/local/bin/install_packages.sh` and run:
+```bash
+#!/usr/bin/env bash
+# Phase 1: install core packages on Ubuntu 24
+set -euo pipefail
+
+echo "Updating apt and installing core packages..."
+sudo apt update
+sudo apt install -y nginx mariadb-server redis-server git unzip zip apt-transport-https ca-certificates lsb-release software-properties-common
+
+echo "Installing PHP (adjust version if needed)..."
+sudo apt install -y php8.2-fpm php8.2-cli php8.2-mysql php8.2-curl php8.2-xml php8.2-mbstring php8.2-zip php8.2-intl
+
+echo "Installing certbot nginx plugin..."
+sudo apt install -y certbot python3-certbot-nginx
+
+echo "Installing .NET runtime repository and runtime (8.0 example)..."
+wget -q https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb -O /tmp/packages-microsoft-prod.deb
+sudo dpkg -i /tmp/packages-microsoft-prod.deb
+sudo apt update
+sudo apt install -y dotnet-runtime-8.0
+
+echo "Enabling services..."
+sudo systemctl enable --now nginx
+sudo systemctl enable --now php8.2-fpm
+sudo systemctl enable --now mariadb
+sudo systemctl enable --now redis-server
+
+echo "Core packages installed."
+```
+
+Acceptance
+- nginx, php-fpm, mariadb, redis, dotnet runtime, and certbot installed and active.
+
+---
+
+## Phase 2 — Filesystem layout, group and initial tenant user
+Purpose: establish where sites live and create tenant users and group.
+
+Save as `/usr/local/bin/create_tenant_user.sh` and run:
+```bash
+#!/usr/bin/env bash
+# Phase 2: create webusers group, tenant user and base directories
+set -euo pipefail
+
+TENANT="${1:-tenant1}"
+WEBROOT_BASE="/var/www/sites"
+
+echo "Creating webusers group and tenant user ${TENANT}..."
+sudo groupadd -f webusers
+if ! id -u "${TENANT}" >/dev/null 2>&1; then
+  sudo useradd -m -g webusers -s /usr/sbin/nologin "${TENANT}"
+fi
+
+echo "Creating base directories under ${WEBROOT_BASE}..."
+sudo mkdir -p "${WEBROOT_BASE}"
+sudo chown root:webusers "${WEBROOT_BASE}"
+sudo chmod 2775 "${WEBROOT_BASE}"
+
+echo "Creating tenant directory..."
+sudo mkdir -p "${WEBROOT_BASE}/${TENANT}"
+sudo chown -R "${TENANT}":webusers "${WEBROOT_BASE}/${TENANT}"
+sudo chmod -R 2750 "${WEBROOT_BASE}/${TENANT}"
+
+echo "Tenant user and directories created: ${TENANT}"
+```
+
+Acceptance
+- `/var/www/sites` exists with correct group and modes.
+- Tenant user exists and owns the tenant directory.
+
+---
+
+## Phase 3 — nginx HTTP vhost template
+Purpose: allow ACME challenge and redirect HTTP → HTTPS.
+
+Create the vhost template at `/etc/nginx/sites-available/<domain>.conf` (replace placeholders):
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name example.com www.example.com;
+
+    root /var/www/sites/tenant1/example.com/public;
+    index index.php index.html index.htm;
+
+    access_log /var/log/nginx/example.com.access.log;
+    error_log  /var/log/nginx/example.com.error.log;
+
+    # Allow ACME challenge to pass through
+    location ~ ^/\.well-known/acme-challenge/ {
+        allow all;
+        root /var/www/sites/tenant1/example.com/public;
+        try_files $uri =404;
+    }
+
+    # Redirect all other HTTP to HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+```
+
+Acceptance
+- `nginx -t` passes and HTTP requests for server IP respond or redirect.
+
+---
+
+## Phase 4 — nginx HTTPS vhost template (proxy + PHP)
+Purpose: serve static/PHP content and proxy to Kestrel for ASP.NET apps.
+
+Create `/etc/nginx/sites-available/<domain>.ssl.conf` (placeholders replaced during provisioning):
+```nginx
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name example.com www.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
+    root /var/www/sites/tenant1/example.com/public;
+    index index.php index.html index.htm;
+
+    access_log /var/log/nginx/example.com.access.log;
+    error_log  /var/log/nginx/example.com.error.log;
+
+    # Static files
+    location ~* \.(?:css|js|jpg|jpeg|png|gif|ico|svg|woff2?|ttf|map)$ {
+        try_files $uri =404;
+        access_log off;
+        expires max;
+    }
+
+    # PHP handling
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php-fpm-example.com.sock;
+    }
+
+    # Default proxy (if ASP.NET is configured)
+    location / {
+        proxy_pass http://127.0.0.1:5100;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+    }
+
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+}
+```
+
+Acceptance
+- After cert issuance, HTTPS serves content or proxies correctly.
+
+---
+
+## Phase 5 — PHP-FPM per-site pool template
+Purpose: run per-site PHP-FPM pools for process isolation and permission control.
+
+Save as `/etc/php/8.2/fpm/pool.d/<domain>.conf`:
+```ini
+[example.com]
+user = tenant1
+group = webusers
+listen = /run/php/php-fpm-example.com.sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+
+pm = dynamic
+pm.max_children = 10
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+pm.max_requests = 500
+
+php_admin_value[open_basedir] = /var/www/sites/tenant1/example.com/:/usr/share/php/:/tmp/
+php_admin_value[upload_max_filesize] = 50M
+php_admin_value[post_max_size] = 50M
+
+request_slowlog_timeout = 5s
+slowlog = /var/log/php-fpm/example.com-slow.log
+```
+
+Acceptance
+- Socket exists (`/run/php/php-fpm-example.com.sock`) and PHP-FPM pool active.
+
+---
+
+## Phase 6 — systemd template for Kestrel (kestrel@.service)
+Purpose: run ASP.NET Core apps (Kestrel) as systemd instances per-site.
+
+Save as `/etc/systemd/system/kestrel@.service`:
+```ini
+[Unit]
+Description=Kestrel .NET App for %i
+After=network.target
+
+[Service]
+# Instance-specific environment file: /etc/kestrel/%i.env
+EnvironmentFile=/etc/kestrel/%i.env
+WorkingDirectory=/var/www/sites/%i
+# ExecStart expects published App.dll at /var/www/sites/%i/published/App.dll
+ExecStart=/usr/bin/dotnet /var/www/sites/%i/published/App.dll
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=kestrel-%i
+# The User below should be replaced/overridden per instance in provisioning
+User=%i_user
+Group=webusers
+
+# Default limits; tenant slice will provide MemoryMax/CPUQuota in production.
+LimitNOFILE=65536
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Per-instance environment example: `/etc/kestrel/example.com.env`
+```bash
+DOTNET_ENVIRONMENT=Production
+DOTNET_URLS=http://127.0.0.1:5100
+KESTREL_PORT=5100
+KESTREL_APPDIR=/var/www/sites/tenant1/example.com
+KESTREL_USER=tenant1
+KESTREL_GROUP=webusers
+```
+
+Usage
+- Publish app to `/var/www/sites/example.com/published/`
+- `sudo systemctl daemon-reload`
+- `sudo systemctl enable --now kestrel@example.com`
+
+Acceptance
+- `systemctl status kestrel@example.com` shows running; port listening.
+
+---
+
+## Phase 7 — Provisioning script
+Purpose: automate site creation (dirs, nginx vhost, php pool, kestrel env, certbot call).
+
+Save as `/usr/local/bin/provision_site.sh` and make executable:
+```bash
+#!/usr/bin/env bash
+# Usage: sudo provision_site.sh <domain> <tenant> <type> [kestrel_port] [admin_email]
+#  type: php | aspnet | static
+set -euo pipefail
+
+DOMAIN="${1:?domain required}"
+TENANT="${2:?tenant required}"
+TYPE="${3:-php}"
+KESTREL_PORT="${4:-5100}"
+ADMIN_EMAIL="${5:-admin@example.com}"
+
+WEBROOT="/var/www/sites/${TENANT}/${DOMAIN}"
+NGINX_AVAIL="/etc/nginx/sites-available/${DOMAIN}.conf"
+NGINX_SSL="/etc/nginx/sites-available/${DOMAIN}.ssl.conf"
+NGINX_ENABLED="/etc/nginx/sites-enabled/${DOMAIN}.conf"
+PHP_POOL="/etc/php/8.2/fpm/pool.d/${DOMAIN}.conf"
+KESTREL_ENV="/etc/kestrel/${DOMAIN}.env"
+
+echo "Provisioning domain=${DOMAIN} tenant=${TENANT} type=${TYPE}"
+
+# Create directories and set ownership
+sudo mkdir -p "${WEBROOT}/public"
+sudo chown -R "${TENANT}":webusers "/var/www/sites/${TENANT}"
+sudo chmod -R 2750 "/var/www/sites/${TENANT}"
+
+# Default index
+if [ ! -f "${WEBROOT}/public/index.html" ]; then
+  sudo tee "${WEBROOT}/public/index.html" > /dev/null <<HTML
+<!doctype html>
+<html><head><meta charset="utf-8"><title>${DOMAIN}</title></head>
+<body><h1>${DOMAIN}</h1><p>Provisioned on $(date -u +"%Y-%m-%d %H:%M:%SZ")</p></body></html>
+HTML
+  sudo chown "${TENANT}":webusers "${WEBROOT}/public/index.html"
+fi
+
+# Nginx HTTP vhost
+sudo tee "${NGINX_AVAIL}" > /dev/null <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN} www.${DOMAIN};
+    root ${WEBROOT}/public;
+    index index.php index.html;
+    location ~ ^/\.well-known/acme-challenge/ {
+        allow all;
+        root ${WEBROOT}/public;
+        try_files \$uri =404;
+    }
+    location / { return 301 https://\$host\$request_uri; }
+}
+NGINX
+
+sudo ln -sf "${NGINX_AVAIL}" "${NGINX_ENABLED}"
+sudo nginx -t
+sudo systemctl reload nginx
+
+# PHP pool (if required)
+if [ "${TYPE}" = "php" ]; then
+  sudo tee "${PHP_POOL}" > /dev/null <<PHPPOOL
+[${DOMAIN}]
+user = ${TENANT}
+group = webusers
+listen = /run/php/php-fpm-${DOMAIN}.sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+pm = dynamic
+pm.max_children = 8
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+pm.max_requests = 500
+php_admin_value[open_basedir] = ${WEBROOT}/:/usr/share/php/:/tmp/
+php_admin_value[upload_max_filesize] = 50M
+php_admin_value[post_max_size] = 50M
+request_slowlog_timeout = 5s
+slowlog = /var/log/php-fpm/${DOMAIN}-slow.log
+PHPPOOL
+  sudo systemctl reload php8.2-fpm
+fi
+
+# ASP.NET Kestrel setup
+if [ "${TYPE}" = "aspnet" ]; then
+  sudo mkdir -p /etc/kestrel
+  sudo tee "${KESTREL_ENV}" > /dev/null <<KESTENV
+DOTNET_ENVIRONMENT=Production
+DOTNET_URLS=http://127.0.0.1:${KESTREL_PORT}
+KESTREL_PORT=${KESTREL_PORT}
+KESTREL_APPDIR=${WEBROOT}
+KESTREL_USER=${TENANT}
+KESTREL_GROUP=webusers
+KESTENV
+  sudo chown root:root "${KESTREL_ENV}"
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now "kestrel@${DOMAIN}" || true
+fi
+
+# Create HTTPS vhost template (will be filled by certbot)
+sudo tee "${NGINX_SSL}" > /dev/null <<NGINXSSL
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${DOMAIN} www.${DOMAIN};
+
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
+    root ${WEBROOT}/public;
+    index index.php index.html;
+
+    access_log /var/log/nginx/${DOMAIN}.access.log;
+    error_log  /var/log/nginx/${DOMAIN}.error.log;
+
+    location ~* \.(?:css|js|jpg|jpeg|png|gif|ico|svg|woff2?|ttf|map)$ {
+        try_files \$uri =404;
+        access_log off;
+        expires max;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php-fpm-${DOMAIN}.sock;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:${KESTREL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+    }
+
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+}
+NGINXSSL
+
+# Try to issue certificate (non-blocking if DNS not yet pointed)
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -n --agree-tos --email "${ADMIN_EMAIL}" -d "${DOMAIN}" -d "www.${DOMAIN}" || true
+
+echo "Provisioning complete for ${DOMAIN}"
+```
+
+Acceptance
+- Running the script creates the site structure and attempts certificate issuance.
+
+---
+
+## Phase 8 — Tenant slice (cgroup) creation script
+Purpose: enforce MemoryMax and CPUQuota via systemd slices.
+
+Save as `/usr/local/sbin/create_tenant_slice.sh`:
+```bash
+#!/usr/bin/env bash
+# Usage: sudo create_tenant_slice.sh <tenant_slug> <memory_mb> <cpu_percent>
+set -euo pipefail
+
+TENANT="${1:?tenant required}"
+MEM_MB="${2:?memory mb required}"
+CPU_PCT="${3:?cpu percent required}"
+
+SLICE_NAME="tenant-${TENANT}.slice"
+SLICE_FILE="/etc/systemd/system/${SLICE_NAME}"
+
+cat > "${SLICE_FILE}" <<EOF
+[Unit]
+Description=Slice for tenant ${TENANT}
+
+[Slice]
+MemoryMax=${MEM_MB}M
+CPUQuota=${CPU_PCT}%
+DefaultTimeoutStopSec=10s
+EOF
+
+systemctl daemon-reload
+systemctl start "${SLICE_NAME}"
+echo "Created slice ${SLICE_NAME} MemoryMax=${MEM_MB}MB CPUQuota=${CPU_PCT}%"
+```
+
+Usage
+- Create slice: `sudo /usr/local/sbin/create_tenant_slice.sh tenant1 512 50`
+- Put services into slice by adding `Slice=tenant-tenant1.slice` under `[Service]` in the service override (`sudo systemctl edit kestrel@...`).
+
+Acceptance
+- Slice exists and MemoryMax/CPUQuota applied.
+
+---
+
+## Phase 9 — Database schema
+Purpose: persistent storage for tenants, users, quotas, password resets, and audit logs.
+
+Save as `schema.sql` and apply to your DB (Postgres/MariaDB adjustments may be needed):
+```sql
+-- Minimal schema: tenants, users, resource_quotas, password_resets, audit_logs
+
+CREATE TABLE tenants (
+  id          BIGSERIAL PRIMARY KEY,
+  slug        TEXT UNIQUE NOT NULL,
+  name        TEXT NOT NULL,
+  owner_user  BIGINT,
+  created_at  TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE TABLE users (
+  id            BIGSERIAL PRIMARY KEY,
+  tenant_id     BIGINT REFERENCES tenants(id),
+  email         TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role          TEXT NOT NULL, -- admin | reseller | user
+  created_at    TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE TABLE resource_quotas (
+  id         BIGSERIAL PRIMARY KEY,
+  tenant_id  BIGINT REFERENCES tenants(id),
+  cpu_pct    INT DEFAULT 100,   -- percent CPU quota
+  ram_mb     INT DEFAULT 1024,
+  disk_mb    INT DEFAULT 10240,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE TABLE password_resets (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     BIGINT REFERENCES users(id),
+  token_hash  TEXT NOT NULL,
+  expires_at  TIMESTAMP WITH TIME ZONE NOT NULL,
+  used        BOOLEAN DEFAULT FALSE,
+  created_at  TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE TABLE audit_logs (
+  id         BIGSERIAL PRIMARY KEY,
+  actor      TEXT,
+  action     TEXT,
+  details    JSONB,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+```
+
+Acceptance
+- Schema applied; you can insert a test tenant and user.
+
+---
+
+## Phase 10 — Restic backup script
+Purpose: backup site files and DB dumps to S3-compatible storage.
+
+Save as `/usr/local/bin/restic_backup.sh`:
+```bash
+#!/usr/bin/env bash
+# restic backup wrapper - configure env vars before use:
+# export RESTIC_REPOSITORY="s3:s3.amazonaws.com/your-bucket"
+# export RESTIC_PASSWORD="somepassword"
+# export AWS_ACCESS_KEY_ID=...
+# export AWS_SECRET_ACCESS_KEY=...
+set -euo pipefail
+
+TAG="${1:-daily}"
+
+# Directories to backup
+BACKUP_PATHS=(/var/www/sites /var/backups/db)
+
+echo "Running restic backup for tag=${TAG}..."
+restic backup "${BACKUP_PATHS[@]}" --tag "${TAG}"
+echo "Prune old snapshots (keep 7 daily)..."
+restic forget --prune --keep-daily 7 --keep-weekly 4 --keep-monthly 6
+
+echo "Restic backup done."
+```
+
+Acceptance
+- A test restic backup runs and restores successfully to a test location.
+
+---
+
+## Phase 11 — node_exporter installer
+Purpose: install Prometheus node_exporter for server metrics.
+
+Save as `/usr/local/bin/install_node_exporter.sh` and run:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="${1:-1.7.1}"
+ARCHIVE="node_exporter-${VERSION}.linux-amd64.tar.gz"
+URL="https://github.com/prometheus/node_exporter/releases/download/v${VERSION}/${ARCHIVE}"
+
+echo "Downloading node_exporter v${VERSION}..."
+wget -q "${URL}" -O /tmp/${ARCHIVE}
+tar -xzf /tmp/${ARCHIVE} -C /tmp
+sudo cp /tmp/node_exporter-${VERSION}.linux-amd64/node_exporter /usr/local/bin/
+sudo useradd --no-create-home --shell /bin/false node_exporter || true
+
+sudo tee /etc/systemd/system/node_exporter.service > /dev/null <<SERVICE
+[Unit]
+Description=Prometheus Node Exporter
+After=network.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now node_exporter
+echo "node_exporter installed and started on port 9100."
+```
+
+Acceptance
+- `node_exporter` running and reachable on port 9100.
+
+---
+
+## Phase 12 — Minimal control-plane skeleton (password-reset example)
+Purpose: example control-plane endpoint to demonstrate secure token creation and audit logging. This is a minimal Node.js sketch — expand for production with auth, RBAC, rate-limiting, and email sending.
+
+Save as `/opt/control-plane/app.js`:
+```javascript
+// Minimal express control-plane skeleton exposing a password-reset creation endpoint.
+// In production: add authentication, RBAC, secure email sending, and proper error handling.
+const express = require('express');
+const crypto = require('crypto');
+const { Client } = require('pg');
+
+const app = express();
+app.use(express.json());
+
+const db = new Client({ connectionString: process.env.DATABASE_URL });
+db.connect();
+
+function generateToken() {
+  return crypto.randomBytes(48).toString('base64url');
+}
+
+app.post('/resets', async (req, res) => {
+  // body: { user_email, initiated_by }
+  const { user_email, initiated_by } = req.body;
+  if (!user_email) return res.status(400).send({ error: 'user_email required' });
+
+  const token = generateToken();
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const expiresAt = new Date(Date.now() + 60*60*1000); // 1 hour
+
+  const u = await db.query('SELECT id FROM users WHERE email=$1', [user_email]);
+  if (u.rows.length === 0) return res.status(404).send({ error: 'user not found' });
+
+  const userId = u.rows[0].id;
+  await db.query(
+    'INSERT INTO password_resets(user_id, token_hash, expires_at) VALUES($1,$2,$3)',
+    [userId, tokenHash, expiresAt]
+  );
+
+  // TODO: send email to user with reset link containing original token (not tokenHash)
+  console.log('TOKEN (send to user email):', token);
+
+  await db.query('INSERT INTO audit_logs(actor, action, details) VALUES($1,$2,$3)', [
+    initiated_by || 'system',
+    'password_reset_requested',
+    JSON.stringify({ user_email, userId }),
+  ]);
+
+  res.send({ message: 'reset requested' });
+});
+
+app.listen(3000, () => console.log('control-plane mock on :3000'));
+```
+
+Acceptance
+- Token hashed and inserted into `password_resets`; audit log created. Email sending must be implemented for real flow.
+
+---
+
+## Phase 13 — Testing, monitoring, and production rollout
+Checklist
+- Run full functional tests: create tenants, provision sites, test password resets (user & reseller flows).
+- Run performance/load tests for target site count (start small, iteratively increase).
+- Verify quota enforcement (MemoryMax / CPUQuota) by creating slices and forcing resource usage.
+- Verify automated backups and test a restore.
+- Configure Prometheus + Grafana dashboards and alerting (cert renewals, disk, CPU, memory).
+- Harden (fail2ban, AppArmor, TLS ciphers, SSH key-only).
+
+---
+
+## Appendices
+
+### Useful commands
+- Reload systemd and enable service:
+  - `sudo systemctl daemon-reload && sudo systemctl enable --now kestrel@example.com`
+- Test nginx:
+  - `sudo nginx -t && sudo systemctl reload nginx`
+- Set a service into a slice (override):
+  - `sudo systemctl edit kestrel@example.com`
+  - Add under `[Service]`:
+    ```
+    Slice=tenant-tenant1.slice
+    ```
+
+### Notes & recommendations
+- Use certbot `--staging` during testing.
+- Convert the scripts into Ansible playbooks for idempotence.
+- For heavy ASP.NET usage consider containerizing (LXD/Podman) and adding a scheduler (Nomad/Kubernetes).
+- Do NOT store plaintext password reset tokens; only store a secure hash.
+- Implement rate-limiting and CAPTCHA on public endpoints (forgot password).
+
+---
+
+End of installation plan.
